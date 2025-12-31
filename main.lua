@@ -1,67 +1,117 @@
--- Services
+--// =========================
+--// Services
+--// =========================
 local Players = game:GetService("Players")
 local Teams = game:GetService("Teams")
 local Workspace = game:GetService("Workspace")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local ServerStorage = game:GetService("ServerStorage")
 
--- Modules
-local TNTModule = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("TNTModule"))
+--// =========================
+--// Modules
+--// =========================
+local TNTModule = require(
+	ReplicatedStorage:WaitForChild("Modules"):WaitForChild("TNTModule")
+)
 
--- Spawns
+--// =========================
+--// Constants / Settings
+--// =========================
+local ROUND_TIME = 240
+local INTERMISSION_TIME = 30
+local TEAM_NAMES = { "Red", "Yellow", "Green", "Blue" }
+local TEAM_PREFIX = "Team "
+local TNT_LIMIT = 250
+local TNT_PER_PLAYER = 16
+local MARGIN = 50
+
+--// =========================
+--// Workspace References
+--// =========================
 local LobbySpawn = Workspace:WaitForChild("LobbySpawn")
 local GameSpawn = Workspace:WaitForChild("GameSpawn")
 
--- Map Setup
 local Map = Workspace:WaitForChild("Map")
 local Center = Map:WaitForChild("Center")
 local Roof = Map:WaitForChild("Roof")
 local TNTFolder = Workspace:WaitForChild("TNTs")
-local roundInProgress = false
 
--- Settings
-local ROUND_TIME = 240
-local INTERMISSION_TIME = 30
-local TNT_COUNT = math.min(250, 16 * (#Players:GetPlayers() + 10))
-local TEAM_NAMES = {"Red", "Yellow", "Green", "Blue"}
-local LOBBY_TEAM = Teams:FindFirstChild("Lobby")
+--// =========================
+--// Teams
+--// =========================
+local LOBBY_TEAM = Teams:WaitForChild("Lobby")
 
--- Remotes
+--// =========================
+--// Remotes
+--// =========================
 local UpdateCoins = ReplicatedStorage:WaitForChild("UpdateCoins")
 local UpdateWin = ReplicatedStorage:WaitForChild("UpdateWin")
 local BotRefreshEvent = ReplicatedStorage:WaitForChild("RefreshBot")
 
--- Bounds
-local MARGIN = 50
-local minX = Center.Position.X - Center.Size.X / 2 + MARGIN
-local maxX = Center.Position.X + Center.Size.X / 2 - MARGIN
-local minZ = Center.Position.Z - Center.Size.Z / 2 + MARGIN
-local maxZ = Center.Position.Z + Center.Size.Z / 2 - MARGIN
-local minY = Center.Position.Y + Center.Size.Y / 2
-local maxY = Roof.Position.Y - Roof.Size.Y / 2
+--// =========================
+--// Runtime State
+--// =========================
+local roundInProgress = false
 
--- GUI Update
+--// =========================
+--// Utility Functions
+--// =========================
+local function getCharacter(player)
+	return player.Character or player.CharacterAdded:Wait()
+end
+
+local function getHRP(player)
+	local char = getCharacter(player)
+	return char:WaitForChild("HumanoidRootPart", 2)
+end
+
+local function getSpawnForPlayer(player)
+	if player.Team == LOBBY_TEAM then
+		return LobbySpawn
+	end
+	return GameSpawn
+end
+
+local function getTeamByName(name)
+	return Teams:FindFirstChild(TEAM_PREFIX .. name)
+end
+
+local function getTNTCount()
+	local players = #Players:GetPlayers()
+	return math.min(TNT_LIMIT, TNT_PER_PLAYER * (players + 10))
+end
+
+--// =========================
+--// UI Helpers
+--// =========================
 local function updatePlayerGUI(player, bottomText, topText)
 	local gui = player:FindFirstChild("PlayerGui")
-	if gui then
-		local timer = gui:FindFirstChild("Timer")
-		if timer then
-			local main = timer:FindFirstChild("Main")
-			if main then
-				local top = main:FindFirstChild("Top")
-				local bottom = main:FindFirstChild("Bottom")
-				if top and top:FindFirstChildOfClass("TextLabel") then
-					top:FindFirstChildOfClass("TextLabel").Text = topText or ""
-				end
-				if bottom and bottom:FindFirstChildOfClass("TextLabel") then
-					bottom:FindFirstChildOfClass("TextLabel").Text = bottomText or ""
-				end
-			end
-		end
+	if not gui then return end
+
+	local timer = gui:FindFirstChild("Timer")
+	if not timer then return end
+
+	local main = timer:FindFirstChild("Main")
+	if not main then return end
+
+	local topLabel = main:FindFirstChild("Top") and main.Top:FindFirstChildOfClass("TextLabel")
+	local bottomLabel = main:FindFirstChild("Bottom") and main.Bottom:FindFirstChildOfClass("TextLabel")
+
+	if topLabel then
+		topLabel.Text = topText or ""
+	end
+
+	if bottomLabel then
+		bottomLabel.Text = bottomText or ""
 	end
 end
 
--- WinStatus Update
+local function broadcastUI(topText, bottomText)
+	for _, player in ipairs(Players:GetPlayers()) do
+		updatePlayerGUI(player, bottomText, topText)
+	end
+end
+
 local function winStatusUI(player, bottomText, topText, show, isVictory)
 	local gui = player:FindFirstChild("PlayerGui")
 	if not gui then return end
@@ -80,7 +130,7 @@ local function winStatusUI(player, bottomText, topText, show, isVictory)
 
 	if top and top:IsA("TextLabel") then
 		top.Text = topText or ""
-		top.TextColor3 = isVictory == false and Color3.new(1, 0, 0) or Color3.new(1, 1, 1)
+		top.TextColor3 = isVictory and Color3.new(1, 1, 1) or Color3.new(1, 0, 0)
 	end
 
 	if bottom and bottom:IsA("TextLabel") then
@@ -88,48 +138,36 @@ local function winStatusUI(player, bottomText, topText, show, isVictory)
 	end
 end
 
-local function broadcastUI(top, bottom)
-	for _, player in ipairs(Players:GetPlayers()) do
-		updatePlayerGUI(player, bottom, top)
-	end
-end
-
--- Team Management
+--// =========================
+--// Team Management
+--// =========================
 local function assignPlayersToTeams()
 	local allPlayers = Players:GetPlayers()
 	table.sort(allPlayers, function(a, b)
 		return a.UserId < b.UserId
 	end)
 
-	for i, player in ipairs(allPlayers) do
-		local teamName = TEAM_NAMES[((i - 1) % #TEAM_NAMES) + 1]
+	for index, player in ipairs(allPlayers) do
+		local teamName = TEAM_NAMES[((index - 1) % #TEAM_NAMES) + 1]
 		local team = Teams:FindFirstChild(teamName)
 		if team then
 			player.Team = team
-		else
-			warn("Team not found:", teamName)
 		end
 	end
 end
 
 local function assignToSmallestTeam(player)
-	local teamSizes = {}
+	local smallestTeam
+	local smallestCount = math.huge
 
 	for _, name in ipairs(TEAM_NAMES) do
 		local team = Teams:FindFirstChild(name)
 		if team then
-			teamSizes[team] = #team:GetPlayers()
-		end
-	end
-
-	-- Find the team with the smallest player count
-	local smallestTeam = nil
-	local fewest = math.huge
-
-	for team, count in pairs(teamSizes) do
-		if count < fewest then
-			fewest = count
-			smallestTeam = team
+			local count = #team:GetPlayers()
+			if count < smallestCount then
+				smallestCount = count
+				smallestTeam = team
+			end
 		end
 	end
 
@@ -138,109 +176,96 @@ local function assignToSmallestTeam(player)
 	end
 end
 
--- Teleport
-local function teleportToSpawn(player)
-	local setSpawn = (player.Team == LOBBY_TEAM and LobbySpawn) or GameSpawn
-	if not setSpawn then return end
+--// =========================
+--// Teleportation
+--// =========================
+local function teleportPlayer(player)
+	local spawn = getSpawnForPlayer(player)
+	if not spawn then return end
 
-	local char = player.Character or player.CharacterAdded:Wait()
-	local hrp = char:FindFirstChild("HumanoidRootPart") or char:WaitForChild("HumanoidRootPart", 2)
+	local hrp = getHRP(player)
+	if not hrp then return end
 
-	if hrp then
-		-- Move character to spawn point + slight offset
-		char:PivotTo(setSpawn.CFrame + Vector3.new(0, 5, 0))
-
-		-- Attempt to stop animations
-		local humanoid = char:FindFirstChildWhichIsA("Humanoid")
-		if humanoid then
-			local animator = humanoid:FindFirstChild("Animator")
-			if animator then
-				for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
-					--track:Stop()
-				end
-			end
-		end
-	else
-		warn("Could not teleport", player.Name, "- HumanoidRootPart missing.")
-	end
+	hrp.Parent:PivotTo(spawn.CFrame + Vector3.new(0, 5, 0))
 end
 
 local function teleportAllToLobby()
 	for _, player in ipairs(Players:GetPlayers()) do
 		player.Team = LOBBY_TEAM
-		teleportToSpawn(player)
+		teleportPlayer(player)
 	end
 end
 
 local function teleportPlayersToGame()
 	for _, player in ipairs(Players:GetPlayers()) do
-		print("Teleporting", player.Name, "Team:", player.Team and player.Team.Name or "None")
 		if player.Team ~= LOBBY_TEAM then
-			teleportToSpawn(player)
+			teleportPlayer(player)
 		end
 	end
 end
 
--- TNT
+--// =========================
+--// TNT Logic
+--// =========================
+local minX = Center.Position.X - Center.Size.X / 2 + MARGIN
+local maxX = Center.Position.X + Center.Size.X / 2 - MARGIN
+local minZ = Center.Position.Z - Center.Size.Z / 2 + MARGIN
+local maxZ = Center.Position.Z + Center.Size.Z / 2 - MARGIN
+local minY = Center.Position.Y + Center.Size.Y / 2
+local maxY = Roof.Position.Y - Roof.Size.Y / 2
+
 local function spawnTNTs()
-	for _ = 1, TNT_COUNT do
-		local randX = math.random() * (maxX - minX) + minX
-		local randY = math.random() * (maxY - minY) + minY
-		local randZ = math.random() * (maxZ - minZ) + minZ
-		TNTModule.spawnTNT(Vector3.new(randX, randY, randZ))
+	for _ = 1, getTNTCount() do
+		local pos = Vector3.new(
+			math.random() * (maxX - minX) + minX,
+			math.random() * (maxY - minY) + minY,
+			math.random() * (maxZ - minZ) + minZ
+		)
+		TNTModule.spawnTNT(pos)
 	end
 end
 
 local function getTeamWithMostTNT()
-	local highestAmount = -1
-	local losingTeamName = nil
+	local highest = -1
+	local losingTeam
+
 	for _, name in ipairs(TEAM_NAMES) do
 		local model = Map:FindFirstChild(name)
-		if model then
-			local base = model:FindFirstChild("Base")
-			if base and base:FindFirstChild("Amount") then
-				local amount = base.Amount.Value
-				if amount > highestAmount then
-					highestAmount = amount
-					losingTeamName = name
-				end
-			end
+		local base = model and model:FindFirstChild("Base")
+		local amount = base and base:FindFirstChild("Amount")
+
+		if amount and amount.Value > highest then
+			highest = amount.Value
+			losingTeam = name
 		end
 	end
-	return losingTeamName
+
+	return losingTeam
 end
 
-local function eliminateTeam(name)
-	local team = Teams:FindFirstChild("Team " .. name)
-	if team then
-		for _, player in ipairs(team:GetPlayers()) do
-			teleportToSpawn(player)
-			for _, tnt in ipairs(TNTFolder:GetChildren()) do
-				if tnt:IsA("BasePart") then
-					TNTModule.explodeTNT(tnt)
-				end
+local function eliminateTeam(teamName)
+	local team = getTeamByName(teamName)
+	if not team then return end
+
+	for _, player in ipairs(team:GetPlayers()) do
+		player.Team = LOBBY_TEAM
+		teleportPlayer(player)
+
+		if player.Character then
+			local humanoid = player.Character:FindFirstChildOfClass("Humanoid")
+			if humanoid then
+				humanoid.Health = 0
 			end
-			if player.Character then
-				local hum = player.Character:FindFirstChildOfClass("Humanoid")
-				if hum then hum.Health = 0 end
-			end
-			player.Team = LOBBY_TEAM
 		end
 	end
 end
 
-local function handleRespawn(player)
-	player.CharacterAdded:Connect(function()
-		task.wait(0.25)
-		if player.Team == LOBBY_TEAM then
-			teleportToSpawn(player)
-		end
-	end)
-end
-
--- Round System
+--// =========================
+--// Round Flow
+--// =========================
 local function runRound()
 	roundInProgress = true
+
 	BotRefreshEvent:Fire()
 	assignPlayersToTeams()
 	broadcastUI("Spawning TNT", "Get Ready...")
@@ -249,58 +274,68 @@ local function runRound()
 	teleportPlayersToGame()
 	spawnTNTs()
 
-	for i = ROUND_TIME, 0, -1 do
-		broadcastUI("Game in progress", i .. "s")
+	for timeLeft = ROUND_TIME, 0, -1 do
+		broadcastUI("Game in progress", timeLeft .. "s")
 		task.wait(1)
 	end
 
-	local loser = getTeamWithMostTNT()
+	local losingTeam = getTeamWithMostTNT()
 
-	if loser then
-		broadcastUI("Round Over", "Team " .. loser .. " loses!")
+	if losingTeam then
+		broadcastUI("Round Over", "Team " .. losingTeam .. " loses!")
 
-		for _, player in pairs(Players:GetPlayers()) do
-			local isLoser = player.Team and player.Team.Name == loser
-			local coins = isLoser and 150 or 500
-			local topText = isLoser and "Defeat" or "Victory"
-			local bottomText = "You earned +" .. tostring(coins) .. " coins"
+		for _, player in ipairs(Players:GetPlayers()) do
+			local lost = player.Team and player.Team.Name == losingTeam
+			local coins = lost and 150 or 500
 
-			winStatusUI(player, bottomText, topText, true, not isLoser)
+			winStatusUI(
+				player,
+				"You earned +" .. coins .. " coins",
+				lost and "Defeat" or "Victory",
+				true,
+				not lost
+			)
 
 			UpdateCoins:Fire(player, coins)
-			if not isLoser then
+			if not lost then
 				UpdateWin:Fire(player)
 			end
 		end
 
 		task.wait(10)
-		eliminateTeam(loser)
+		eliminateTeam(losingTeam)
 	else
 		broadcastUI("Round Over", "No team lost")
 	end
 
-	-- 🔻 HIDE victory/defeat screen for all players
-	for _, player in pairs(Players:GetPlayers()) do
+	for _, player in ipairs(Players:GetPlayers()) do
 		winStatusUI(player, "", "", false)
 	end
 
 	task.wait(5)
 	TNTModule.clearTNT()
 	teleportAllToLobby()
+
 	roundInProgress = false
 end
 
 local function intermission()
-	for i = INTERMISSION_TIME, 0, -1 do
-		broadcastUI("Intermission", i .. "s")
+	for timeLeft = INTERMISSION_TIME, 0, -1 do
+		broadcastUI("Intermission", timeLeft .. "s")
 		task.wait(1)
 	end
 	runRound()
 end
 
--- Player Join
+--// =========================
+--// Player Handling
+--// =========================
 Players.PlayerAdded:Connect(function(player)
-	handleRespawn(player)
+	player.CharacterAdded:Connect(function()
+		task.wait(0.25)
+		teleportPlayer(player)
+	end)
+
 	task.wait(1)
 
 	if roundInProgress then
@@ -308,13 +343,15 @@ Players.PlayerAdded:Connect(function(player)
 		updatePlayerGUI(player, "Joining...", "Game in progress")
 	else
 		player.Team = LOBBY_TEAM
-		updatePlayerGUI(player, tostring(INTERMISSION_TIME) .. "s", "Intermission")
+		updatePlayerGUI(player, INTERMISSION_TIME .. "s", "Intermission")
 	end
 
-	teleportToSpawn(player)
+	teleportPlayer(player)
 end)
 
--- Start Game Loop
+--// =========================
+--// Main Loop
+--// =========================
 while true do
 	intermission()
 end
