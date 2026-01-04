@@ -1,6 +1,18 @@
+--// ============================================================
+--// CORE GAME ROUND CONTROLLER
+--// This script owns the entire round lifecycle:
+--// Intermission → Team assignment → Teleport → TNT spawning
+--// → Round timer → Loss evaluation → Rewards → Cleanup
+--// ============================================================
+
 --// =========================
---// Services
+--// Roblox Services
 --// =========================
+-- Players: authoritative list of connected players and lifecycle events
+-- Teams: used for server-side team assignment and filtering
+-- Workspace: spatial authority for spawns, map bounds, and TNT containers
+-- ReplicatedStorage: shared runtime assets (modules + remotes)
+-- ServerStorage: reserved for server-only assets (not used directly here)
 local Players = game:GetService("Players")
 local Teams = game:GetService("Teams")
 local Workspace = game:GetService("Workspace")
@@ -10,13 +22,25 @@ local ServerStorage = game:GetService("ServerStorage")
 --// =========================
 --// Modules
 --// =========================
+-- TNTModule is responsible for:
+--  • Spawning TNT instances
+--  • Tracking them internally
+--  • Cleaning them up safely between rounds
+-- This script treats TNTModule as a black-box service.
 local TNTModule = require(
 	ReplicatedStorage:WaitForChild("Modules"):WaitForChild("TNTModule")
 )
 
 --// =========================
---// Constants / Settings
+--// Match Configuration
 --// =========================
+-- ROUND_TIME: active gameplay duration
+-- INTERMISSION_TIME: downtime between rounds
+-- TEAM_NAMES: logical team identifiers (must exist in Teams + Map)
+-- TEAM_PREFIX: used when teams are named "Team Red", etc.
+-- TNT_LIMIT: absolute cap to prevent server overload
+-- TNT_PER_PLAYER: scaling factor per population
+-- MARGIN: spatial padding to avoid wall/edge spawns
 local ROUND_TIME = 240
 local INTERMISSION_TIME = 30
 local TEAM_NAMES = { "Red", "Yellow", "Green", "Blue" }
@@ -26,8 +50,9 @@ local TNT_PER_PLAYER = 16
 local MARGIN = 50
 
 --// =========================
---// Workspace References
+--// World References
 --// =========================
+-- All references are resolved once and reused for performance
 local LobbySpawn = Workspace:WaitForChild("LobbySpawn")
 local GameSpawn = Workspace:WaitForChild("GameSpawn")
 
@@ -39,23 +64,31 @@ local TNTFolder = Workspace:WaitForChild("TNTs")
 --// =========================
 --// Teams
 --// =========================
+-- Lobby team represents non-participating / idle players
 local LOBBY_TEAM = Teams:WaitForChild("Lobby")
 
 --// =========================
---// Remotes
+--// Remote Events
 --// =========================
+-- UpdateCoins: server → client currency sync
+-- UpdateWin: server-side win counter increment
+-- BotRefreshEvent: forces AI/bots to reset state between rounds
 local UpdateCoins = ReplicatedStorage:WaitForChild("UpdateCoins")
 local UpdateWin = ReplicatedStorage:WaitForChild("UpdateWin")
 local BotRefreshEvent = ReplicatedStorage:WaitForChild("RefreshBot")
 
 --// =========================
---// Runtime State
+--// Runtime State Flags
 --// =========================
+-- Prevents duplicate round starts and controls join behavior
 local roundInProgress = false
 
 --// =========================
---// Utility Functions
+--// Character / Movement Utilities
 --// =========================
+-- These helpers normalize common character access patterns
+-- and protect against race conditions during respawn.
+
 local function getCharacter(player)
 	return player.Character or player.CharacterAdded:Wait()
 end
@@ -65,6 +98,7 @@ local function getHRP(player)
 	return char:WaitForChild("HumanoidRootPart", 2)
 end
 
+-- Determines correct spawn based on team state
 local function getSpawnForPlayer(player)
 	if player.Team == LOBBY_TEAM then
 		return LobbySpawn
@@ -72,18 +106,23 @@ local function getSpawnForPlayer(player)
 	return GameSpawn
 end
 
+-- Resolves a team object from logical name
 local function getTeamByName(name)
 	return Teams:FindFirstChild(TEAM_PREFIX .. name)
 end
 
+-- Dynamically scales TNT count with population,
+-- while enforcing a hard upper bound for server safety
 local function getTNTCount()
 	local players = #Players:GetPlayers()
 	return math.min(TNT_LIMIT, TNT_PER_PLAYER * (players + 10))
 end
 
 --// =========================
---// UI Helpers
+--// UI Synchronization Helpers
 --// =========================
+-- UI is fully server-driven to prevent desync or exploit risk.
+
 local function updatePlayerGUI(player, bottomText, topText)
 	local gui = player:FindFirstChild("PlayerGui")
 	if not gui then return end
@@ -106,12 +145,15 @@ local function updatePlayerGUI(player, bottomText, topText)
 	end
 end
 
+-- Broadcasts UI state atomically to all players
 local function broadcastUI(topText, bottomText)
 	for _, player in ipairs(Players:GetPlayers()) do
 		updatePlayerGUI(player, bottomText, topText)
 	end
 end
 
+-- Victory/Defeat overlay controller
+-- Color and text are server-authoritative
 local function winStatusUI(player, bottomText, topText, show, isVictory)
 	local gui = player:FindFirstChild("PlayerGui")
 	if not gui then return end
@@ -139,8 +181,11 @@ local function winStatusUI(player, bottomText, topText, show, isVictory)
 end
 
 --// =========================
---// Team Management
+--// Team Assignment Logic
 --// =========================
+-- Deterministic team distribution based on UserId ordering
+-- ensures fairness and avoids bias across server restarts.
+
 local function assignPlayersToTeams()
 	local allPlayers = Players:GetPlayers()
 	table.sort(allPlayers, function(a, b)
@@ -156,6 +201,8 @@ local function assignPlayersToTeams()
 	end
 end
 
+-- Used for late-joiners during an active round
+-- Keeps team sizes as balanced as possible
 local function assignToSmallestTeam(player)
 	local smallestTeam
 	local smallestCount = math.huge
@@ -177,8 +224,11 @@ local function assignToSmallestTeam(player)
 end
 
 --// =========================
---// Teleportation
+--// Teleportation System
 --// =========================
+-- Uses Model:PivotTo to ensure full character reposition
+-- without physics drift or partial CFrame updates.
+
 local function teleportPlayer(player)
 	local spawn = getSpawnForPlayer(player)
 	if not spawn then return end
@@ -205,8 +255,10 @@ local function teleportPlayersToGame()
 end
 
 --// =========================
---// TNT Logic
+--// TNT Spawn & Evaluation Logic
 --// =========================
+-- Bounding box is computed once for efficiency.
+
 local minX = Center.Position.X - Center.Size.X / 2 + MARGIN
 local maxX = Center.Position.X + Center.Size.X / 2 - MARGIN
 local minZ = Center.Position.Z - Center.Size.Z / 2 + MARGIN
@@ -225,6 +277,7 @@ local function spawnTNTs()
 	end
 end
 
+-- Determines losing team based on accumulated TNT mass/value
 local function getTeamWithMostTNT()
 	local highest = -1
 	local losingTeam
@@ -243,6 +296,10 @@ local function getTeamWithMostTNT()
 	return losingTeam
 end
 
+-- Eliminates a team by:
+--  • Removing them from gameplay
+--  • Killing characters
+--  • Returning them to lobby state
 local function eliminateTeam(teamName)
 	local team = getTeamByName(teamName)
 	if not team then return end
@@ -261,7 +318,7 @@ local function eliminateTeam(teamName)
 end
 
 --// =========================
---// Round Flow
+--// Round Lifecycle Controller
 --// =========================
 local function runRound()
 	roundInProgress = true
@@ -319,6 +376,9 @@ local function runRound()
 	roundInProgress = false
 end
 
+--// =========================
+--// Intermission Loop
+--// =========================
 local function intermission()
 	for timeLeft = INTERMISSION_TIME, 0, -1 do
 		broadcastUI("Intermission", timeLeft .. "s")
@@ -328,7 +388,7 @@ local function intermission()
 end
 
 --// =========================
---// Player Handling
+--// Player Lifecycle Handling
 --// =========================
 Players.PlayerAdded:Connect(function(player)
 	player.CharacterAdded:Connect(function()
@@ -350,7 +410,7 @@ Players.PlayerAdded:Connect(function(player)
 end)
 
 --// =========================
---// Main Loop
+--// Main Server Loop
 --// =========================
 while true do
 	intermission()
